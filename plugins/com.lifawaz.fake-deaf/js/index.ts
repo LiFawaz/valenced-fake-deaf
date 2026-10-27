@@ -12,6 +12,7 @@ const state: FakeDeafenSettings = {
   fakeDeafen: true,
 };
 
+let activeApi: any = null;
 let originalSend: ((...args: any[]) => any) | null = null;
 let patchedSocket: any = null;
 let unpatches: Array<() => void> = [];
@@ -69,9 +70,7 @@ function patchGateway(api: any): void {
 }
 
 function restoreGateway(): void {
-  if (patchedSocket && originalSend) {
-    patchedSocket.send = originalSend;
-  }
+  if (patchedSocket && originalSend) patchedSocket.send = originalSend;
   patchedSocket = null;
   originalSend = null;
 }
@@ -101,16 +100,8 @@ function forceVoiceState(api: any): void {
   }
 
   const channel = channelStore?.getChannel?.(channelId);
-  const realMute =
-    mediaStore?.isSelfMute?.() ??
-    mediaStore?.isMute?.() ??
-    mediaStore?.isLocalMute?.() ??
-    false;
-  const realDeaf =
-    mediaStore?.isSelfDeaf?.() ??
-    mediaStore?.isDeaf?.() ??
-    mediaStore?.isLocalDeaf?.() ??
-    false;
+  const realMute = mediaStore?.isSelfMute?.() ?? mediaStore?.isMute?.() ?? mediaStore?.isLocalMute?.() ?? false;
+  const realDeaf = mediaStore?.isSelfDeaf?.() ?? mediaStore?.isDeaf?.() ?? mediaStore?.isLocalDeaf?.() ?? false;
 
   socket.send(4, {
     guild_id: channel?.guild_id ?? null,
@@ -122,26 +113,30 @@ function forceVoiceState(api: any): void {
   });
 }
 
-function setEnabled(api: any, enabled: boolean): void {
+function setEnabled(enabled: boolean): void {
   state.enabled = enabled;
-  forceVoiceState(api);
+  if (activeApi) forceVoiceState(activeApi.unscoped);
 }
 
 export default plugin({
   start(api: any) {
+    activeApi = api;
     state.enabled = false;
     patchGateway(api.unscoped);
-    // Discord's gateway module can initialize after plugins start.
-    const unsub = api.unscoped.discord.utils.modules.metro.subscriptions.onModuleFinishedImporting(() => {
-      patchGateway(api.unscoped);
-    });
-    if (typeof unsub === "function") unpatches.push(unsub);
+
+    const subscribe = api.unscoped.discord.utils.modules.metro.subscriptions.onModuleFinishedImporting;
+    if (typeof subscribe === "function") {
+      const unsub = subscribe(() => patchGateway(api.unscoped));
+      if (typeof unsub === "function") unpatches.push(unsub);
+    }
+
     api.cleanup(() => {
       restoreGateway();
       for (const unpatch of unpatches.splice(0)) {
         try { unpatch(); } catch {}
       }
       state.enabled = false;
+      activeApi = null;
     });
     console.log("[fake-deaf] loaded; configure it from plugin settings");
   },
@@ -151,11 +146,12 @@ export default plugin({
     for (const unpatch of unpatches.splice(0)) {
       try { unpatch(); } catch {}
     }
+    activeApi = null;
   },
 
   SettingsComponent() {
-    const api = (globalThis as any).valenced;
-    const React = api?.react ?? (globalThis as any).React;
+    const api = activeApi?.unscoped ?? (globalThis as any).valenced;
+    const React = api?.react;
     const FormSwitch = api?.components?.FormSwitch;
     if (!React?.createElement || !FormSwitch) {
       return React?.createElement?.("RCTText", null, "Fake-deaf settings are unavailable in this Valenced build.") ?? null;
@@ -168,10 +164,7 @@ export default plugin({
         label: "Fake Deafen Active",
         subLabel: "Others may see you as muted/deafened while local audio remains live.",
         value: state.enabled,
-        onValueChange: (value: boolean) => {
-          state.enabled = value;
-          console.log("[fake-deaf] enabled:", value);
-        },
+        onValueChange: (value: boolean) => setEnabled(value),
       }),
       React.createElement(FormSwitch, {
         label: "Broadcast as Muted",
