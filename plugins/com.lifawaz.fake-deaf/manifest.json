@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "id": "com.lifawaz.fake-deaf",
+  "name": "Fake-deaf",
+  "description": "A Valenced port scaffold for a local deafened-state utility; no voice-gateway spoofing.",
+  "author": "LiFawaz (https://github.com/LiFawaz)",
+  "version": "0.1.0",
+  "dependencies": {
+    "valenced.api": {
+      "version": ">=1 <2"
+    },
+    "discord": {
+      "version": "*"
+    }
+  },
+  "dist": {
+    "script": "index.js"
+  }
+}
