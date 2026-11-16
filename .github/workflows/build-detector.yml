@@ -18,6 +18,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Check manifest
         run: node -e 'const fs=require("fs"); const m=JSON.parse(fs.readFileSync("plugins/com.lifawaz.fake-deafen-detector/manifest.json","utf8")); if(m.format!==1 || m.id!=="com.lifawaz.fake-deafen-detector" || m.dist?.script!=="index.js") process.exit(1); console.log("Manifest OK",m.version)'
 
