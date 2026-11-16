@@ -1,25 +1,33 @@
-# Fake Deafen Detector (Valenced)
+# Fake Mute / Fake Deafen Detector (Valenced)
 
-## Version 1.0.2
+## Version 1.0.3
 
-- Includes your own account in detection instead of excluding it.
-- Adds a self-test that compares Discord's server-reported `self_deaf` state with the local client's deafen state.
-- If the server says your account is deafened while the local client reports that it is not deafened for longer than the confirmation delay, the plugin records a high-confidence local/server mismatch and displays a notification.
-- Continues monitoring other members in your current voice channel. A remote member is flagged when Discord reports a speaking event while their `self_deaf` state is active.
-- The settings screen displays the self-test status and keeps a local detection history with display name, @username, user ID, evidence type, count, and last-seen time.
+This experimental build checks Fake Mute and Fake Deafen separately and together.
 
-## What the self-test can establish
+### Self-test
 
-The self-test can detect a mismatch between the state Discord receives for your account and the local deafen state reported by the current Valenced client. This is especially useful for testing a Fake Deafen implementation that changes the outgoing/server `self_deaf` state without changing the local deafen state.
+For your own account, the plugin compares the server-reported state from `VoiceStateStore.getVoiceStateForUser()` with the local media state from `MediaEngineStore.isSelfMute()` and `MediaEngineStore.isSelfDeaf()`.
 
-A persistent mismatch is strong evidence that the reported status does not match the local client state. It does not prove what audio physically reached your speakers or ears.
+It can report:
+- Fake Mute: server says muted, local media engine says not muted.
+- Fake Deafen: server says deafened, local media engine says not deafened.
+- Both: both mismatches remain present for the confirmation period.
 
-## Limits for other participants
+The settings page shows the four live values (server mute, local mute, server deafen, local deafen) so missing store access or an unavailable getter is visible instead of silently failing.
 
-Valenced can observe server voice states and speaking notifications for other members, but it cannot directly inspect another person's local audio output or private client state. Remote detection therefore requires a speaking notification while the member is server-marked as self-deafened. A method that suppresses speaking notifications or does not transmit microphone activity may not be detectable from your client.
+### Other members
 
-## Install and test
+For other members, the plugin can only observe Discord's server voice state and speaking notifications. It flags a speaking notification if that member is marked self-muted or self-deafened. This can catch a member who is actively transmitting speech while appearing muted/deafened.
 
-Download the installable ZIP from the latest successful run of the GitHub Actions workflow. Install the inner plugin ZIP in Valenced through **Advanced → Install from file**.
+It cannot inspect another person's local media engine. A remote user who is fake-deafened but never transmits speaking activity, or a fake status that suppresses speaking notifications, cannot be proven fake from your client alone.
 
-For the self-test, join a voice channel, turn on your Fake Deafen setup, and watch the **Self-test** line in plugin settings. A successful build verifies packaging and compilation only; the behavior still needs to be confirmed in a live voice channel.
+### Test steps
+
+1. Install the ZIP from the latest successful build artifact.
+2. Join a voice channel and open this plugin's settings.
+3. Turn on Fake Mute only. After the short confirmation delay, expect the server/local mute values to disagree and a Fake Mute notification.
+4. Turn Fake Mute off, then test Fake Deafen only.
+5. Finally enable both and expect both pairs to disagree.
+6. Turn the fake switches off and verify that the four values match again.
+
+A successful build confirms compilation and packaging, not a live Discord test. If any of the four values shows `unavailable`, the settings page will identify which side failed to expose a state value.
