@@ -1,6 +1,7 @@
 /// <reference types="@valenced/types" />
 
-import { Stores, onAnyFluxEventDispatched } from "@valenced/discord/flux";
+import { Stores, getStore, onAnyFluxEventDispatched } from "@valenced/discord/flux";
+import { before } from "@valenced/patcher";
 import { ToastActionCreators } from "@valenced/discord/actions";
 
 type AnyRecord = Record<string, any>;
@@ -19,7 +20,10 @@ const detections = new Map<string, Detection>();
 const alertedUsers = new Set<string>();
 const pendingChecks = new Map<string, ReturnType<typeof setTimeout>>();
 const settingsListeners = new Set<() => void>();
+const lastEvidenceAt = new Map<string, number>();
 let stopListening: (() => void) | null = null;
+let stopWaitingForMediaEngine: (() => void) | null = null;
+let unpatchNativeSpeaking: (() => void) | null = null;
 let notificationsEnabled = true;
 
 const CONFIRM_DELAY_MS = 2200;
@@ -188,6 +192,11 @@ function evaluateSpeaker(userId: string, eventData: AnyRecord): void {
   if (eventChannelId && eventChannelId !== ownState.channelId) return;
   if (!memberState.selfDeaf) return;
 
+  const now = Date.now();
+  const lastEvidence = lastEvidenceAt.get(userId) ?? 0;
+  if (now - lastEvidence < 1400) return;
+  lastEvidenceAt.set(userId, now);
+
   const stableFor = Date.now() - memberState.deafSince;
   const confirm = () => {
     const latestOwn = getOwnVoiceState();
@@ -252,6 +261,30 @@ function handleEvent(event: AnyRecord): AnyRecord {
     }
   } catch (error) { log("Event handler error", String(error)); }
   return event;
+}
+
+function installNativeSpeakingHook(store?: AnyRecord): void {
+  if (unpatchNativeSpeaking) return;
+  const target = store ?? safeStore("MediaEngineStore");
+  if (!target || typeof target.handleSpeakingNative !== "function") {
+    log("MediaEngineStore.handleSpeakingNative is not available on this build; Flux speaking events remain enabled.");
+    return;
+  }
+
+  try {
+    unpatchNativeSpeaking = before(target, "handleSpeakingNative", (args: unknown[]) => {
+      const userId = args[0];
+      const speaking = args[1];
+      const isActive = speaking === true || (typeof speaking === "number" && speaking !== 0);
+      if (isActive && isSnowflake(userId)) {
+        evaluateSpeaker(userId, { source: "MediaEngineStore.handleSpeakingNative" });
+      }
+      return args;
+    });
+    log("Native speaking hook installed.");
+  } catch (error) {
+    log("Could not hook native speaking handler", String(error));
+  }
 }
 
 function clearDetections(): void {
@@ -332,13 +365,20 @@ export default plugin({
   start({ cleanup }: any) {
     voiceStates.clear(); detections.clear(); alertedUsers.clear(); pendingChecks.clear();
     settingsListeners.clear();
+    lastEvidenceAt.clear();
     try {
+      installNativeSpeakingHook();
+      stopWaitingForMediaEngine = getStore<AnyRecord>("MediaEngineStore", store => installNativeSpeakingHook(store as AnyRecord));
       stopListening = onAnyFluxEventDispatched((event: AnyRecord) => handleEvent(event));
       cleanup(() => {
         try { stopListening?.(); } catch {}
         stopListening = null;
+        try { stopWaitingForMediaEngine?.(); } catch {}
+        stopWaitingForMediaEngine = null;
+        try { unpatchNativeSpeaking?.(); } catch {}
+        unpatchNativeSpeaking = null;
         for (const timer of pendingChecks.values()) clearTimeout(timer);
-        pendingChecks.clear(); voiceStates.clear(); detections.clear(); alertedUsers.clear();
+        pendingChecks.clear(); voiceStates.clear(); detections.clear(); alertedUsers.clear(); lastEvidenceAt.clear();
         settingsListeners.clear();
       });
       log("Started. Watching for speaking signals that conflict with self-deafen state.");
@@ -347,8 +387,12 @@ export default plugin({
   stop() {
     try { stopListening?.(); } catch {}
     stopListening = null;
+    try { stopWaitingForMediaEngine?.(); } catch {}
+    stopWaitingForMediaEngine = null;
+    try { unpatchNativeSpeaking?.(); } catch {}
+    unpatchNativeSpeaking = null;
     for (const timer of pendingChecks.values()) clearTimeout(timer);
-    pendingChecks.clear(); voiceStates.clear(); detections.clear(); alertedUsers.clear();
+    pendingChecks.clear(); voiceStates.clear(); detections.clear(); alertedUsers.clear(); lastEvidenceAt.clear();
     settingsListeners.clear();
   },
   SettingsComponent: settingsComponent,
