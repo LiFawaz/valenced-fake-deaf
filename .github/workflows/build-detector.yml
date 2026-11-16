@@ -1,0 +1,59 @@
+name: Build Fake Deafen Detector
+
+on:
+  push:
+    branches: [test/fake-deafen-detector-prototype]
+    paths:
+      - "plugins/com.lifawaz.fake-deafen-detector/**"
+      - ".github/workflows/build-detector.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check manifest
+        run: node -e 'const fs=require("fs"); const m=JSON.parse(fs.readFileSync("plugins/com.lifawaz.fake-deafen-detector/manifest.json","utf8")); if(m.format!==1 || m.id!=="com.lifawaz.fake-deafen-detector" || m.dist?.script!=="index.js") process.exit(1); console.log("Manifest OK",m.version)'
+
+      - name: Get Valenced build template
+        run: git clone --depth 1 https://github.com/Valenced/valenced-plugin-template.git valenced-template
+
+      - name: Copy detector source
+        run: cp -R "plugins/com.lifawaz.fake-deafen-detector" "valenced-template/plugins/com.lifawaz.fake-deafen-detector"
+
+      - name: Install dependencies
+        working-directory: valenced-template
+        run: bun install
+
+      - name: Build JavaScript
+        working-directory: valenced-template
+        run: bun run build com.lifawaz.fake-deafen-detector
+
+      - name: Verify bundle
+        run: test -s "valenced-template/plugins/com.lifawaz.fake-deafen-detector/build/js/index.js"
+
+      - name: Package installable ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package dist
+          cp "plugins/com.lifawaz.fake-deafen-detector/manifest.json" package/manifest.json
+          cp "valenced-template/plugins/com.lifawaz.fake-deafen-detector/build/js/index.js" package/index.js
+          version="$(node -p 'require("./package/manifest.json").version')"
+          plugin_id="$(node -p 'require("./package/manifest.json").id')"
+          (cd package && zip -q "../dist/${plugin_id}@${version}.zip" manifest.json index.js)
+          unzip -t "dist/${plugin_id}@${version}.zip"
+
+      - name: Upload installable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: com.lifawaz.fake-deafen-detector-installable-zip
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
