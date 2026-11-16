@@ -2,9 +2,9 @@
   "format": 1,
   "id": "com.lifawaz.fake-deafen-detector",
   "name": "Fake Deafen Detector",
-  "description": "Detects local/server mismatches for fake mute and fake deafen, including combined states, and checks remote speaking conflicts.",
+  "description": "Detects fake mute and fake deafen by comparing server voice state with the connected local RTC connection, and monitors remote voice activity.",
   "author": "LiFawaz (https://github.com/LiFawaz)",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "dependencies": {
     "valenced.api": {
       "version": ">=1 <2"
