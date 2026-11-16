@@ -1,25 +1,22 @@
-# Fake-deaf (Valenced)
+# Fake Deafen Detector (Valenced)
 
-A Valenced port of [LiFawaz/Fake-deaf](https://github.com/LiFawaz/Fake-deaf).
+Experimental Valenced plugin that watches for one specific mismatch: Discord's voice state says a participant is self-deafened, but Discord also reports that the same participant started speaking in the same voice channel.
 
-## What it does
+## Version 1.0.1
 
-- Adds a Fake Deafen Active switch in plugin settings.
-- Lets you choose whether outgoing voice-state updates report you as muted and/or deafened.
-- Leaves local microphone/audio processing unchanged; this changes the voice-state sent to Discord.
-- Attempts to push the current voice state immediately when toggled while connected to voice.
+- Detection toast displays the member's display name and @username.
+- Settings include a local list of detected accounts, user IDs, evidence counts, and last-seen times.
+- Speaking events are checked against the current VoiceStateStore state and your current voice channel.
+- A short stability delay reduces false positives caused by event ordering.
+
+## Important limitation
+
+The signal is strong evidence of a voice-state/speaking mismatch, not absolute proof that the person actually heard audio on their device. Discord's speaking signal is a voice-gateway speaking-state notification; this plugin does not receive another participant's private audio output or inspect their device.
+
+The plugin therefore says **Possible Fake Deafen** instead of making a guaranteed accusation. It cannot detect every fake-deafen method, especially methods that suppress speaking events or do not transmit microphone activity.
 
 ## Install
 
-Download the **installable ZIP** from the latest successful run of the GitHub Actions workflow in this repository. Use the artifact named `com.lifawaz.fake-deaf-installable-zip`, then install that ZIP through Valenced's **Advanced → Install from file**.
+Download the installable ZIP from the latest successful run of the GitHub Actions workflow. Install the inner plugin ZIP in Valenced through **Advanced → Install from file**.
 
-Do not download the whole Actions artifact ZIP and install it directly if it contains another ZIP inside; install the inner plugin ZIP with `manifest.json` at its root.
-
-## Compatibility notes
-
-This port uses Discord's internal module shapes to locate the gateway and voice stores, which can change between Discord/Valenced versions. A successful build confirms packaging, not live runtime compatibility. If the gateway socket or settings component cannot be found in your Valenced build, check the plugin logs and report the exact error.
-
-## Source layout
-
-- `plugins/com.lifawaz.fake-deaf/manifest.json` — Valenced manifest
-- `plugins/com.lifawaz.fake-deaf/js/index.ts` — plugin implementation
+A successful build verifies packaging and compilation only. It does not replace testing inside a live voice channel.

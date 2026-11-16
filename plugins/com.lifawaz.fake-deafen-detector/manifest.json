@@ -2,9 +2,9 @@
   "format": 1,
   "id": "com.lifawaz.fake-deafen-detector",
   "name": "Fake Deafen Detector",
-  "description": "Flags possible fake deafen when a deafened voice participant continues sending speaking activity.",
+  "description": "Detects strong voice-activity signals from participants whose Discord voice state says self-deafened, and keeps a local detection list.",
   "author": "LiFawaz (https://github.com/LiFawaz)",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "dependencies": {
     "valenced.api": {
       "version": ">=1 <2"
