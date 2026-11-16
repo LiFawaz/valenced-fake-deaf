@@ -299,10 +299,10 @@ function showDetectionToast(detection: Detection): void {
       : detection.kind === "self-fake-deafen"
         ? "Your server state says Deafened, but your local media state says undeafened."
         : "Discord reported speaking while this user was server-marked Muted or Deafened.";
-  const text = "Possible Fake Deafen detected\n" + detection.displayName + "\n" +
+  const text = "Possible Fake Voice State detected\n" + detection.displayName + "\n" +
     username + "\n" + reason;
   try {
-    ToastActionCreators.open("fake-deafen-detected-" + detection.userId, { text, variant: "critical" });
+    ToastActionCreators.open("fake-voice-state-detected-" + detection.userId, { text, variant: "critical" });
   } catch (error) { log("Toast failed", String(error), detection.userId); }
 }
 
@@ -340,7 +340,7 @@ function evaluateSpeaker(userId: string, eventData: AnyRecord): void {
       alertedUsers.add(userId);
       showDetectionToast(detection);
     }
-    log("STRONG_FAKE_DEAFEN_SIGNAL", detection);
+    log("STRONG_FAKE_VOICE_STATE_SIGNAL", detection);
   };
 
   if (stableFor < CONFIRM_DELAY_MS) {
@@ -470,7 +470,7 @@ function settingsComponent({ api }: { api: any }): any {
 
   if (ordered.length === 0) {
     children.push(h(RN.Text, { key: "empty", style: detailStyle },
-      "No suspicious speaking/deafen mismatches detected in this session."
+      "No suspicious mute/deafen mismatches detected in this session."
     ));
   } else {
     for (const item of ordered) {
