@@ -33,6 +33,7 @@ let stopWaitingForMediaEngine: (() => void) | null = null;
 let stopWaitingForVoiceState: (() => void) | null = null;
 let stopVoiceActivityListener: (() => void) | null = null;
 let mediaEngineForActivity: AnyRecord | null = null;
+let voiceActivityHandler: ((userId: string, voiceActivity: number) => void) | null = null;
 let notificationsEnabled = true;
 let localVoiceControlStore: AnyRecord | null = null;
 let voiceStateStore: AnyRecord | null = null;
@@ -473,14 +474,14 @@ function handleEvent(event: AnyRecord): AnyRecord {
 function detachVoiceActivityListener(): void {
   try {
     const engine = mediaEngineForActivity;
-    const handler = (detachVoiceActivityListener as AnyRecord).__handler;
-    if (engine && handler && typeof engine.off === "function") {
-      engine.off("VoiceActivity", handler);
+    if (engine && voiceActivityHandler && typeof engine.off === "function") {
+      engine.off("VoiceActivity", voiceActivityHandler);
     }
   } catch (error) {
     log("Could not detach VoiceActivity listener", String(error));
   }
   mediaEngineForActivity = null;
+  voiceActivityHandler = null;
   stopVoiceActivityListener = null;
 }
 
@@ -503,12 +504,12 @@ function attachVoiceActivityListener(): void {
   try {
     engine.on("VoiceActivity", handler);
     mediaEngineForActivity = engine;
-    (detachVoiceActivityListener as AnyRecord).__handler = handler;
+    voiceActivityHandler = handler;
     stopVoiceActivityListener = () => {
       try { engine?.off?.("VoiceActivity", handler); } catch {}
       if (mediaEngineForActivity === engine) mediaEngineForActivity = null;
+      if (voiceActivityHandler === handler) voiceActivityHandler = null;
       stopVoiceActivityListener = null;
-      delete (detachVoiceActivityListener as AnyRecord).__handler;
     };
     log("MediaEngine VoiceActivity listener installed.");
   } catch (error) {
