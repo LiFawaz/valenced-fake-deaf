@@ -3,20 +3,19 @@
 import { Stores, getStore, onAnyFluxEventDispatched } from "@valenced/discord/flux";
 import { before } from "@valenced/patcher";
 import { ToastActionCreators } from "@valenced/discord/actions";
-import { lookupModules } from "@valenced/modules/finders";
-import { withProps } from "@valenced/modules/finders/filters";
 
 type AnyRecord = Record<string, any>;
 type VoiceState = {
   userId: string; channelId: string | null; guildId: string | null;
-  selfDeaf: boolean; selfMute: boolean | undefined; deafSince: number; updatedAt: number;
+  selfDeaf: boolean; selfMute: boolean | undefined; flagsSince: number; updatedAt: number;
 };
 type Detection = {
   userId: string; displayName: string; username: string; channelId: string;
   guildId: string | null; firstSeen: number; lastSeen: number;
   evidenceCount: number; evidence: string;
-  kind: "self-state-mismatch" | "remote-speaking-mismatch";
+  kind: "self-fake-mute" | "self-fake-deafen" | "self-fake-mute-and-deafen" | "remote-speaking-mismatch";
 };
+type LocalVoiceFlags = { selfMute: boolean | null; selfDeaf: boolean | null };
 
 const voiceStates = new Map<string, VoiceState>();
 const detections = new Map<string, Detection>();
@@ -26,12 +25,15 @@ const settingsListeners = new Set<() => void>();
 const lastEvidenceAt = new Map<string, number>();
 let stopListening: (() => void) | null = null;
 let stopWaitingForMediaEngine: (() => void) | null = null;
+let stopWaitingForVoiceState: (() => void) | null = null;
 let unpatchNativeSpeaking: (() => void) | null = null;
 let notificationsEnabled = true;
 let localVoiceControlStore: AnyRecord | null = null;
+let voiceStateStore: AnyRecord | null = null;
 let selfProbeTimer: ReturnType<typeof setInterval> | null = null;
 let selfMismatchSince = 0;
-let selfProbeStatus = "Waiting for voice state...";
+let selfMismatchKey = "";
+let selfProbeStatus = "Waiting for Discord voice stores...";
 
 const CONFIRM_DELAY_MS = 2200;
 const MAX_DETECTIONS = 100;
@@ -51,45 +53,34 @@ function currentUserId(): string | null {
 function findLocalVoiceControlStore(): AnyRecord | null {
   if (localVoiceControlStore) return localVoiceControlStore;
   const direct = safeStore("MediaEngineStore");
-  if (direct && (typeof direct.isSelfDeaf === "function" ||
-      typeof direct.isDeaf === "function" || typeof direct.isLocalDeaf === "function")) {
+  if (direct) {
     localVoiceControlStore = direct;
     return direct;
-  }
-  const candidates = [
-    ["isSelfMute", "isSelfDeaf"],
-    ["isMute", "isDeaf"],
-    ["isLocalMute", "isLocalDeaf"],
-  ];
-  for (const props of candidates) {
-    try {
-      for (const [mod] of lookupModules(withProps(...props) as any)) {
-        if (mod && typeof mod === "object") {
-          localVoiceControlStore = mod as AnyRecord;
-          return localVoiceControlStore;
-        }
-      }
-    } catch (error) {
-      log("Local voice-control lookup failed", String(error));
-    }
   }
   return null;
 }
 
-function getLocalSelfDeaf(): boolean | null {
+function readLocalBoolean(names: string[]): boolean | null {
   const store = findLocalVoiceControlStore();
   if (!store) return null;
-  for (const name of ["isSelfDeaf", "isDeaf", "isLocalDeaf"]) {
+  for (const name of names) {
     try {
       const getter = store[name];
       if (typeof getter !== "function") continue;
       const value = getter.call(store);
       if (typeof value === "boolean") return value;
     } catch (error) {
-      log("Local deafen getter failed", name, String(error));
+      log("Local voice flag getter failed", name, String(error));
     }
   }
   return null;
+}
+
+function getLocalVoiceFlags(): LocalVoiceFlags {
+  return {
+    selfMute: readLocalBoolean(["isSelfMute", "isMute"]),
+    selfDeaf: readLocalBoolean(["isSelfDeaf", "isDeaf"]),
+  };
 }
 
 function isSnowflake(value: unknown): value is string {
@@ -112,9 +103,11 @@ function normalizeVoiceState(userId: string, raw: AnyRecord): VoiceState | null 
     userId, channelId, guildId, selfDeaf,
     selfMute: typeof (raw.self_mute ?? raw.selfMute) === "boolean"
       ? Boolean(raw.self_mute ?? raw.selfMute) : previous?.selfMute,
-    deafSince: selfDeaf
-      ? (previous?.selfDeaf && previous.channelId === channelId ? previous.deafSince : now)
-      : 0,
+    flagsSince: previous &&
+      previous.selfDeaf === selfDeaf &&
+      previous.selfMute === (typeof (raw.self_mute ?? raw.selfMute) === "boolean" ? Boolean(raw.self_mute ?? raw.selfMute) : previous.selfMute) &&
+      previous.channelId === channelId
+        ? previous.flagsSince : now,
     updatedAt: now,
   };
 }
@@ -136,7 +129,7 @@ function collectVoiceStates(value: unknown, output: VoiceState[], parentKey = ""
 
 function getVoiceState(userId: string): VoiceState | null {
   try {
-    const store = safeStore("VoiceStateStore");
+    const store = voiceStateStore ?? safeStore("VoiceStateStore");
     const raw = store?.getVoiceStateForUser?.(userId) ?? store?.getVoiceState?.(null, userId) ?? null;
     if (raw && typeof raw === "object") {
       const normalized = normalizeVoiceState(userId, raw as AnyRecord);
@@ -190,6 +183,7 @@ function evaluateSelfMismatch(): void {
   const ownId = currentUserId();
   if (!ownId) {
     selfMismatchSince = 0;
+    selfMismatchKey = "";
     setSelfProbeStatus("Unable to read the current account.");
     return;
   }
@@ -197,54 +191,60 @@ function evaluateSelfMismatch(): void {
   const ownState = getVoiceState(ownId);
   if (!ownState?.channelId) {
     selfMismatchSince = 0;
+    selfMismatchKey = "";
     alertedUsers.delete(ownId);
-    setSelfProbeStatus("Join a voice channel to run the self-test.");
+    setSelfProbeStatus("Join a voice channel. Waiting for your VoiceStateStore entry.");
     return;
   }
 
-  const localDeaf = getLocalSelfDeaf();
-  if (localDeaf === null) {
-    selfMismatchSince = 0;
-    setSelfProbeStatus("Local deafen state is unavailable on this Valenced build.");
-    return;
-  }
+  const local = getLocalVoiceFlags();
+  const serverMute = ownState.selfMute;
+  const serverDeaf = ownState.selfDeaf;
+  const muteMismatch = typeof serverMute === "boolean" && local.selfMute !== null &&
+    serverMute && !local.selfMute;
+  const deafMismatch = typeof serverDeaf === "boolean" && local.selfDeaf !== null &&
+    serverDeaf && !local.selfDeaf;
 
-  if (!ownState.selfDeaf) {
+  const show = (value: boolean | undefined | null) =>
+    value === null || value === undefined ? "unavailable" : value ? "ON" : "OFF";
+  const baseStatus = "Server mute " + show(serverMute) + " / local mute " + show(local.selfMute) +
+    " · Server deafen " + show(serverDeaf) + " / local deafen " + show(local.selfDeaf);
+
+  if (!muteMismatch && !deafMismatch) {
     selfMismatchSince = 0;
+    selfMismatchKey = "";
     alertedUsers.delete(ownId);
-    setSelfProbeStatus(localDeaf
-      ? "Waiting for Discord to sync your normal Deafen state..."
-      : "Self-test: normal state — server and local client both report not deafened.");
+    setSelfProbeStatus("No fake-state mismatch. " + baseStatus);
     return;
   }
 
-  if (localDeaf) {
-    selfMismatchSince = 0;
-    alertedUsers.delete(ownId);
-    setSelfProbeStatus("Self-test: normal Deafen — server and local client both report deafened.");
-    return;
+  const mismatchKey = (muteMismatch ? "mute" : "") + (deafMismatch ? "+deafen" : "");
+  if (selfMismatchKey !== mismatchKey) {
+    selfMismatchKey = mismatchKey;
+    selfMismatchSince = Date.now();
   }
-
-  const now = Date.now();
-  if (!selfMismatchSince) selfMismatchSince = now;
-  const elapsed = now - selfMismatchSince;
+  const elapsed = Date.now() - selfMismatchSince;
   if (elapsed < CONFIRM_DELAY_MS) {
-    setSelfProbeStatus("Checking a server/local Deafen mismatch (" +
-      Math.ceil((CONFIRM_DELAY_MS - elapsed) / 1000) + "s)...");
+    setSelfProbeStatus("Checking " + mismatchKey + " mismatch (" +
+      Math.ceil((CONFIRM_DELAY_MS - elapsed) / 1000) + "s). " + baseStatus);
     return;
   }
 
-  setSelfProbeStatus("Self-test: FAKE DEAFEN MISMATCH — server says deafened, local client says not deafened.");
+  const kind: Detection["kind"] = muteMismatch && deafMismatch
+    ? "self-fake-mute-and-deafen"
+    : muteMismatch ? "self-fake-mute" : "self-fake-deafen";
+  const label = muteMismatch && deafMismatch ? "FAKE MUTE + FAKE DEAFEN"
+    : muteMismatch ? "FAKE MUTE" : "FAKE DEAFEN";
+  setSelfProbeStatus("DETECTED " + label + ". " + baseStatus);
+
   if (!alertedUsers.has(ownId)) {
-    const detection = addOrUpdateDetection(
-      ownId,
-      ownState,
-      "self-state-mismatch",
-      "Discord Voice State reports self_deaf=true while the local client deafen getter reports false for more than the confirmation delay."
-    );
+    const evidence = "Server flags: self_mute=" + show(serverMute) + ", self_deaf=" + show(serverDeaf) +
+      "; local MediaEngineStore flags: isSelfMute=" + show(local.selfMute) +
+      ", isSelfDeaf=" + show(local.selfDeaf) + "; mismatch persisted over " + CONFIRM_DELAY_MS + "ms.";
+    const detection = addOrUpdateDetection(ownId, ownState, kind, evidence);
     alertedUsers.add(ownId);
     showDetectionToast(detection);
-    log("SELF_FAKE_DEAFEN_MISMATCH", detection);
+    log("SELF_FAKE_VOICE_STATE_MISMATCH", detection);
   }
 }
 
@@ -292,9 +292,13 @@ function addOrUpdateDetection(userId: string, state: VoiceState, kind: Detection
 function showDetectionToast(detection: Detection): void {
   if (!notificationsEnabled) return;
   const username = detection.username.startsWith("@") ? detection.username : "@" + detection.username;
-  const reason = detection.kind === "self-state-mismatch"
-    ? "Your Discord voice state says Deafened, but your local client says not deafened."
-    : "Discord reported speaking while this user was self-deafened.";
+  const reason = detection.kind === "self-fake-mute-and-deafen"
+    ? "Your server state says Muted + Deafened, but your local media state disagrees."
+    : detection.kind === "self-fake-mute"
+      ? "Your server state says Muted, but your local media state says unmuted."
+      : detection.kind === "self-fake-deafen"
+        ? "Your server state says Deafened, but your local media state says undeafened."
+        : "Discord reported speaking while this user was server-marked Muted or Deafened.";
   const text = "Possible Fake Deafen detected\n" + detection.displayName + "\n" +
     username + "\n" + reason;
   try {
@@ -311,24 +315,26 @@ function evaluateSpeaker(userId: string, eventData: AnyRecord): void {
   if (memberState.channelId !== ownState.channelId) return;
   const eventChannelId = toStringOrNull(eventData.channelId ?? eventData.channel_id);
   if (eventChannelId && eventChannelId !== ownState.channelId) return;
-  if (!memberState.selfDeaf) return;
+  if (!memberState.selfDeaf && !memberState.selfMute) return;
 
   const now = Date.now();
   const lastEvidence = lastEvidenceAt.get(userId) ?? 0;
   if (now - lastEvidence < 1400) return;
   lastEvidenceAt.set(userId, now);
 
-  const stableFor = Date.now() - memberState.deafSince;
+  const stableFor = Date.now() - memberState.flagsSince;
   const confirm = () => {
     const latestOwn = getOwnVoiceState();
     const latestMember = getVoiceState(userId);
-    if (!latestOwn?.channelId || latestMember?.channelId !== latestOwn.channelId || !latestMember.selfDeaf) return;
-    if (Date.now() - latestMember.deafSince < CONFIRM_DELAY_MS) return;
+    if (!latestOwn?.channelId || latestMember?.channelId !== latestOwn.channelId ||
+        (!latestMember.selfDeaf && !latestMember.selfMute)) return;
+    if (Date.now() - latestMember.flagsSince < CONFIRM_DELAY_MS) return;
     const detection = addOrUpdateDetection(
       userId,
       latestMember,
       "remote-speaking-mismatch",
-      "Discord reported speaking activity while self_deaf was true in the same voice channel."
+      "Discord reported speaking activity while self_mute=" + latestMember.selfMute +
+        " or self_deaf=" + latestMember.selfDeaf + " in the same voice channel."
     );
     if (!alertedUsers.has(userId)) {
       alertedUsers.add(userId);
@@ -356,7 +362,7 @@ function handleVoiceStateEvents(type: string, data: AnyRecord): void {
   collectVoiceStates(data, found);
   for (const state of found) {
     voiceStates.set(state.userId, state);
-    if (!state.selfDeaf) {
+    if (!state.selfDeaf && !state.selfMute) {
       alertedUsers.delete(state.userId);
       const timer = pendingChecks.get(state.userId);
       if (timer) clearTimeout(timer);
@@ -448,7 +454,7 @@ function settingsComponent({ api }: { api: any }): any {
   const children: any[] = [
     h(RN.Text, { key: "title", style: titleStyle }, "Fake Deafen detections"),
     h(RN.Text, { key: "description", style: subStyle },
-      "Checks every participant in your current voice channel. Your own account is included: the self-test compares Discord's server Deafen state with the local client's Deafen state. Remote accounts are flagged only when Discord reports speaking while they are self-deafened."
+      "Checks your own account by comparing server VoiceStateStore flags with local MediaEngineStore flags for Fake Mute, Fake Deafen, or both. Other members are flagged when Discord reports speaking while their server state says Muted or Deafened."
     ),
     h(RN.Text, { key: "self-test", style: detailStyle }, "Self-test: " + selfProbeStatus),
   ];
@@ -474,8 +480,11 @@ function settingsComponent({ api }: { api: any }): any {
         h(RN.Text, { style: detailStyle }, "@" + item.username.replace(/^@/, "")),
         h(RN.Text, { style: detailStyle }, "User ID: " + item.userId),
         h(RN.Text, { style: detailStyle }, "Evidence signals: " + item.evidenceCount + " · Last seen: " + time),
-        h(RN.Text, { style: detailStyle }, item.kind === "self-state-mismatch" ? "Evidence: server/local self-deafen state mismatch" : "Evidence: speaking event while self-deafened"),
-        h(RN.Text, { style: detailStyle }, "Strong signal — not proof of another device's audio output")
+        h(RN.Text, { style: detailStyle }, item.kind === "self-fake-mute" ? "Evidence: server says muted, local client says unmuted"
+          : item.kind === "self-fake-deafen" ? "Evidence: server says deafened, local client says undeafened"
+          : item.kind === "self-fake-mute-and-deafen" ? "Evidence: server says muted + deafened, local client disagrees"
+          : "Evidence: speaking event while server-marked muted/deafened"),
+        h(RN.Text, { style: detailStyle }, item.evidence)
       ));
     }
   }
@@ -497,30 +506,46 @@ export default plugin({
     lastEvidenceAt.clear();
     localVoiceControlStore = null;
     selfMismatchSince = 0;
-    selfProbeStatus = "Waiting for voice state...";
+    selfProbeStatus = "Waiting for Discord voice stores...";
+    localVoiceControlStore = safeStore("MediaEngineStore");
+    voiceStateStore = safeStore("VoiceStateStore");
     try {
-      installNativeSpeakingHook();
+      installNativeSpeakingHook(localVoiceControlStore ?? undefined);
       if (selfProbeTimer) clearInterval(selfProbeTimer);
-      selfProbeTimer = setInterval(evaluateSelfMismatch, 700);
+      selfProbeTimer = setInterval(evaluateSelfMismatch, 500);
       evaluateSelfMismatch();
-      stopWaitingForMediaEngine = getStore<AnyRecord>("MediaEngineStore", store => installNativeSpeakingHook(store as AnyRecord));
+      stopWaitingForMediaEngine = getStore<AnyRecord>("MediaEngineStore", store => {
+        localVoiceControlStore = store as AnyRecord;
+        installNativeSpeakingHook(localVoiceControlStore);
+        evaluateSelfMismatch();
+        emitSettingsUpdate();
+      });
+      stopWaitingForVoiceState = getStore<AnyRecord>("VoiceStateStore", store => {
+        voiceStateStore = store as AnyRecord;
+        evaluateSelfMismatch();
+        emitSettingsUpdate();
+      });
       stopListening = onAnyFluxEventDispatched((event: AnyRecord) => handleEvent(event));
       cleanup(() => {
         try { stopListening?.(); } catch {}
         stopListening = null;
         try { stopWaitingForMediaEngine?.(); } catch {}
         stopWaitingForMediaEngine = null;
+        try { stopWaitingForVoiceState?.(); } catch {}
+        stopWaitingForVoiceState = null;
         try { unpatchNativeSpeaking?.(); } catch {}
         unpatchNativeSpeaking = null;
         if (selfProbeTimer) clearInterval(selfProbeTimer);
         selfProbeTimer = null;
         localVoiceControlStore = null;
+        voiceStateStore = null;
         selfMismatchSince = 0;
+        selfMismatchKey = "";
         for (const timer of pendingChecks.values()) clearTimeout(timer);
         pendingChecks.clear(); voiceStates.clear(); detections.clear(); alertedUsers.clear(); lastEvidenceAt.clear();
         settingsListeners.clear();
       });
-      log("Started. Watching for speaking signals that conflict with self-deafen state.");
+      log("Started. Comparing local/server self-mute and self-deafen flags, plus remote speaking events.");
     } catch (error) { log("Could not subscribe to Flux events", String(error)); }
   },
   stop() {
