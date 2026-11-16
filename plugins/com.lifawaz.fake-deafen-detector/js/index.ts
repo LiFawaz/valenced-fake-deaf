@@ -15,7 +15,13 @@ type Detection = {
   evidenceCount: number; evidence: string;
   kind: "self-fake-mute" | "self-fake-deafen" | "self-fake-mute-and-deafen" | "remote-speaking-mismatch";
 };
-type LocalVoiceFlags = { selfMute: boolean | null; selfDeaf: boolean | null };
+type LocalVoiceFlags = {
+  selfMute: boolean | null;
+  selfDeaf: boolean | null;
+  connectionId: string | null;
+  connectionState: string | null;
+  ready: boolean;
+};
 
 const voiceStates = new Map<string, VoiceState>();
 const detections = new Map<string, Detection>();
@@ -33,9 +39,12 @@ let voiceStateStore: AnyRecord | null = null;
 let selfProbeTimer: ReturnType<typeof setInterval> | null = null;
 let selfMismatchSince = 0;
 let selfMismatchKey = "";
+let selfReadySince = 0;
+let selfReadyKey = "";
 let selfProbeStatus = "Waiting for Discord voice stores...";
 
-const CONFIRM_DELAY_MS = 2200;
+const JOIN_SETTLE_MS = 3000;
+const CONFIRM_DELAY_MS = 1600;
 const MAX_DETECTIONS = 100;
 
 function log(...args: unknown[]) {
@@ -60,26 +69,60 @@ function findLocalVoiceControlStore(): AnyRecord | null {
   return null;
 }
 
-function readLocalBoolean(names: string[]): boolean | null {
+function getDefaultRtcConnection(userId: string): AnyRecord | null {
   const store = findLocalVoiceControlStore();
-  if (!store) return null;
-  for (const name of names) {
-    try {
-      const getter = store[name];
-      if (typeof getter !== "function") continue;
-      const value = getter.call(store);
-      if (typeof value === "boolean") return value;
-    } catch (error) {
-      log("Local voice flag getter failed", name, String(error));
-    }
+  try {
+    const engine = store?.getMediaEngine?.();
+    const rawConnections = engine?.connections;
+    const connections: AnyRecord[] = rawConnections instanceof Set
+      ? [...rawConnections] : Array.isArray(rawConnections) ? rawConnections : [];
+    const owned = connections.filter(connection =>
+      connection && connection.context === "default" &&
+      connection.userId === userId && connection.destroyed !== true
+    );
+    const connected = owned.filter(connection => connection.connectionState === "CONNECTED");
+    return connected[connected.length - 1] ?? null;
+  } catch (error) {
+    log("Could not read active RTC connection", String(error));
+    return null;
   }
-  return null;
 }
 
-function getLocalVoiceFlags(): LocalVoiceFlags {
+function readConnectionBoolean(connection: AnyRecord, method: string, property: string): boolean | null {
+  try {
+    const getter = connection?.[method];
+    if (typeof getter === "function") {
+      const value = getter.call(connection);
+      return typeof value === "boolean" ? value : null;
+    }
+    const value = connection?.[property];
+    return typeof value === "boolean" ? value : null;
+  } catch (error) {
+    log("RTC state getter failed", method, String(error));
+    return null;
+  }
+}
+
+function getLocalVoiceFlags(userId: string): LocalVoiceFlags {
+  const connection = getDefaultRtcConnection(userId);
+  if (!connection) {
+    return {
+      selfMute: null,
+      selfDeaf: null,
+      connectionId: null,
+      connectionState: null,
+      ready: false,
+    };
+  }
+
+  const selfMute = readConnectionBoolean(connection, "getSelfMute", "selfMute");
+  const selfDeaf = readConnectionBoolean(connection, "getSelfDeaf", "selfDeaf");
   return {
-    selfMute: readLocalBoolean(["isSelfMute", "isMute"]),
-    selfDeaf: readLocalBoolean(["isSelfDeaf", "isDeaf"]),
+    selfMute,
+    selfDeaf,
+    connectionId: toStringOrNull(connection.mediaEngineConnectionId),
+    connectionState: toStringOrNull(connection.connectionState),
+    ready: selfMute !== null && selfDeaf !== null,
   };
 }
 
@@ -192,12 +235,40 @@ function evaluateSelfMismatch(): void {
   if (!ownState?.channelId) {
     selfMismatchSince = 0;
     selfMismatchKey = "";
+    selfReadySince = 0;
+    selfReadyKey = "";
     alertedUsers.delete(ownId);
     setSelfProbeStatus("Join a voice channel. Waiting for your VoiceStateStore entry.");
     return;
   }
 
-  const local = getLocalVoiceFlags();
+  const local = getLocalVoiceFlags(ownId);
+  if (!local.ready || !local.connectionId || local.connectionState !== "CONNECTED") {
+    selfMismatchSince = 0;
+    selfMismatchKey = "";
+    selfReadySince = 0;
+    selfReadyKey = "";
+    alertedUsers.delete(ownId);
+    setSelfProbeStatus("Waiting for a connected default RTC media connection. Server state is not judged yet.");
+    return;
+  }
+
+  const readyKey = ownState.channelId + ":" + local.connectionId;
+  if (selfReadyKey !== readyKey) {
+    selfReadyKey = readyKey;
+    selfReadySince = Date.now();
+    selfMismatchSince = 0;
+    selfMismatchKey = "";
+    setSelfProbeStatus("RTC connected. Letting voice state settle before checking.");
+    return;
+  }
+  const readyFor = Date.now() - selfReadySince;
+  if (readyFor < JOIN_SETTLE_MS) {
+    setSelfProbeStatus("Voice connection settling (" +
+      Math.ceil((JOIN_SETTLE_MS - readyFor) / 1000) + "s). No detection during join.");
+    return;
+  }
+
   const serverMute = ownState.selfMute;
   const serverDeaf = ownState.selfDeaf;
   const muteMismatch = typeof serverMute === "boolean" && local.selfMute !== null &&
@@ -207,8 +278,9 @@ function evaluateSelfMismatch(): void {
 
   const show = (value: boolean | undefined | null) =>
     value === null || value === undefined ? "unavailable" : value ? "ON" : "OFF";
-  const baseStatus = "Server mute " + show(serverMute) + " / local mute " + show(local.selfMute) +
-    " · Server deafen " + show(serverDeaf) + " / local deafen " + show(local.selfDeaf);
+  const baseStatus = "Server mute " + show(serverMute) + " / RTC mute " + show(local.selfMute) +
+    " · Server deafen " + show(serverDeaf) + " / RTC deafen " + show(local.selfDeaf) +
+    " · RTC " + (local.connectionState ?? "unavailable");
 
   if (!muteMismatch && !deafMismatch) {
     selfMismatchSince = 0;
@@ -239,8 +311,9 @@ function evaluateSelfMismatch(): void {
 
   if (!alertedUsers.has(ownId)) {
     const evidence = "Server flags: self_mute=" + show(serverMute) + ", self_deaf=" + show(serverDeaf) +
-      "; local MediaEngineStore flags: isSelfMute=" + show(local.selfMute) +
-      ", isSelfDeaf=" + show(local.selfDeaf) + "; mismatch persisted over " + CONFIRM_DELAY_MS + "ms.";
+      "; active RTC connection flags: getSelfMute=" + show(local.selfMute) +
+      ", getSelfDeaf=" + show(local.selfDeaf) + "; connection=" + String(local.connectionId) +
+      "; mismatch persisted over " + CONFIRM_DELAY_MS + "ms after join settling.";
     const detection = addOrUpdateDetection(ownId, ownState, kind, evidence);
     alertedUsers.add(ownId);
     showDetectionToast(detection);
@@ -506,6 +579,9 @@ export default plugin({
     lastEvidenceAt.clear();
     localVoiceControlStore = null;
     selfMismatchSince = 0;
+    selfMismatchKey = "";
+    selfReadySince = 0;
+    selfReadyKey = "";
     selfProbeStatus = "Waiting for Discord voice stores...";
     localVoiceControlStore = safeStore("MediaEngineStore");
     voiceStateStore = safeStore("VoiceStateStore");
@@ -541,6 +617,8 @@ export default plugin({
         voiceStateStore = null;
         selfMismatchSince = 0;
         selfMismatchKey = "";
+        selfReadySince = 0;
+        selfReadyKey = "";
         for (const timer of pendingChecks.values()) clearTimeout(timer);
         pendingChecks.clear(); voiceStates.clear(); detections.clear(); alertedUsers.clear(); lastEvidenceAt.clear();
         settingsListeners.clear();
@@ -558,7 +636,13 @@ export default plugin({
     if (selfProbeTimer) clearInterval(selfProbeTimer);
     selfProbeTimer = null;
     localVoiceControlStore = null;
+    voiceStateStore = null;
     selfMismatchSince = 0;
+    selfMismatchKey = "";
+    selfReadySince = 0;
+    selfReadyKey = "";
+    try { stopWaitingForVoiceState?.(); } catch {}
+    stopWaitingForVoiceState = null;
     for (const timer of pendingChecks.values()) clearTimeout(timer);
     pendingChecks.clear(); voiceStates.clear(); detections.clear(); alertedUsers.clear(); lastEvidenceAt.clear();
     settingsListeners.clear();
