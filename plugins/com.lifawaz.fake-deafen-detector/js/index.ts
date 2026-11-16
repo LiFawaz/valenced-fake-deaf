@@ -1,7 +1,6 @@
 /// <reference types="@valenced/types" />
 
 import { Stores, getStore, onAnyFluxEventDispatched } from "@valenced/discord/flux";
-import { before } from "@valenced/patcher";
 import { ToastActionCreators } from "@valenced/discord/actions";
 
 type AnyRecord = Record<string, any>;
@@ -32,7 +31,8 @@ const lastEvidenceAt = new Map<string, number>();
 let stopListening: (() => void) | null = null;
 let stopWaitingForMediaEngine: (() => void) | null = null;
 let stopWaitingForVoiceState: (() => void) | null = null;
-let unpatchNativeSpeaking: (() => void) | null = null;
+let stopVoiceActivityListener: (() => void) | null = null;
+let mediaEngineForActivity: AnyRecord | null = null;
 let notificationsEnabled = true;
 let localVoiceControlStore: AnyRecord | null = null;
 let voiceStateStore: AnyRecord | null = null;
@@ -325,8 +325,9 @@ function isSpeakingStartEvent(type: string, data: AnyRecord): boolean {
   if (type.includes("SPEAKING_STOP") || type.includes("SPEAKING_END")) return false;
   if (type.includes("SPEAKING_START")) return true;
   if (type.includes("SPEAKING") || type.includes("VOICE_ACTIVITY")) {
-    const speaking = data.speaking ?? data.isSpeaking ?? data.is_speaking;
-    return speaking === undefined || speaking === true || speaking === 1 ||
+    const speaking = data.speaking ?? data.isSpeaking ?? data.is_speaking ??
+      data.voiceActivity ?? data.voice_activity;
+    return speaking === true || speaking === 1 ||
       (typeof speaking === "number" && speaking > 0);
   }
   return false;
@@ -469,27 +470,49 @@ function handleEvent(event: AnyRecord): AnyRecord {
   return event;
 }
 
-function installNativeSpeakingHook(store?: AnyRecord): void {
-  if (unpatchNativeSpeaking) return;
-  const target = store ?? safeStore("MediaEngineStore");
-  if (!target || typeof target.handleSpeakingNative !== "function") {
-    log("MediaEngineStore.handleSpeakingNative is not available on this build; Flux speaking events remain enabled.");
+function detachVoiceActivityListener(): void {
+  try {
+    const engine = mediaEngineForActivity;
+    const handler = (detachVoiceActivityListener as AnyRecord).__handler;
+    if (engine && handler && typeof engine.off === "function") {
+      engine.off("VoiceActivity", handler);
+    }
+  } catch (error) {
+    log("Could not detach VoiceActivity listener", String(error));
+  }
+  mediaEngineForActivity = null;
+  stopVoiceActivityListener = null;
+}
+
+function attachVoiceActivityListener(): void {
+  const store = localVoiceControlStore ?? safeStore("MediaEngineStore");
+  let engine: AnyRecord | null = null;
+  try { engine = store?.getMediaEngine?.() ?? null; } catch (error) {
+    log("Could not get media engine for VoiceActivity", String(error));
+  }
+  if (!engine || typeof engine.on !== "function" || typeof engine.off !== "function") {
+    log("MediaEngine VoiceActivity subscription unavailable on this build.");
     return;
   }
-
+  if (engine === mediaEngineForActivity) return;
+  detachVoiceActivityListener();
+  const handler = (userId: string, voiceActivity: number) => {
+    if (!isSnowflake(userId) || typeof voiceActivity !== "number" || voiceActivity <= 0) return;
+    evaluateSpeaker(userId, { source: "MediaEngine.VoiceActivity", voiceActivity });
+  };
   try {
-    unpatchNativeSpeaking = before(target, "handleSpeakingNative", (args: unknown[]) => {
-      const userId = args[0];
-      const speaking = args[1];
-      const isActive = speaking === true || (typeof speaking === "number" && speaking !== 0);
-      if (isActive && isSnowflake(userId)) {
-        evaluateSpeaker(userId, { source: "MediaEngineStore.handleSpeakingNative" });
-      }
-      return args;
-    });
-    log("Native speaking hook installed.");
+    engine.on("VoiceActivity", handler);
+    mediaEngineForActivity = engine;
+    (detachVoiceActivityListener as AnyRecord).__handler = handler;
+    stopVoiceActivityListener = () => {
+      try { engine?.off?.("VoiceActivity", handler); } catch {}
+      if (mediaEngineForActivity === engine) mediaEngineForActivity = null;
+      stopVoiceActivityListener = null;
+      delete (detachVoiceActivityListener as AnyRecord).__handler;
+    };
+    log("MediaEngine VoiceActivity listener installed.");
   } catch (error) {
-    log("Could not hook native speaking handler", String(error));
+    log("Could not subscribe to MediaEngine VoiceActivity", String(error));
   }
 }
 
@@ -525,7 +548,7 @@ function settingsComponent({ api }: { api: any }): any {
   const detailStyle = { fontSize: 12, opacity: 0.75, marginTop: 3 };
   const ordered = [...detections.values()].sort((a, b) => b.lastSeen - a.lastSeen);
   const children: any[] = [
-    h(RN.Text, { key: "title", style: titleStyle }, "Fake Deafen detections"),
+    h(RN.Text, { key: "title", style: titleStyle }, "Fake Mute / Deafen detections"),
     h(RN.Text, { key: "description", style: subStyle },
       "Checks your own account by comparing server VoiceStateStore flags with local MediaEngineStore flags for Fake Mute, Fake Deafen, or both. Other members are flagged when Discord reports speaking while their server state says Muted or Deafened."
     ),
@@ -586,13 +609,13 @@ export default plugin({
     localVoiceControlStore = safeStore("MediaEngineStore");
     voiceStateStore = safeStore("VoiceStateStore");
     try {
-      installNativeSpeakingHook(localVoiceControlStore ?? undefined);
+      attachVoiceActivityListener();
       if (selfProbeTimer) clearInterval(selfProbeTimer);
       selfProbeTimer = setInterval(evaluateSelfMismatch, 500);
       evaluateSelfMismatch();
       stopWaitingForMediaEngine = getStore<AnyRecord>("MediaEngineStore", store => {
         localVoiceControlStore = store as AnyRecord;
-        installNativeSpeakingHook(localVoiceControlStore);
+        attachVoiceActivityListener();
         evaluateSelfMismatch();
         emitSettingsUpdate();
       });
@@ -609,8 +632,9 @@ export default plugin({
         stopWaitingForMediaEngine = null;
         try { stopWaitingForVoiceState?.(); } catch {}
         stopWaitingForVoiceState = null;
-        try { unpatchNativeSpeaking?.(); } catch {}
-        unpatchNativeSpeaking = null;
+        try { stopVoiceActivityListener?.(); } catch {}
+        stopVoiceActivityListener = null;
+        mediaEngineForActivity = null;
         if (selfProbeTimer) clearInterval(selfProbeTimer);
         selfProbeTimer = null;
         localVoiceControlStore = null;
@@ -631,8 +655,9 @@ export default plugin({
     stopListening = null;
     try { stopWaitingForMediaEngine?.(); } catch {}
     stopWaitingForMediaEngine = null;
-    try { unpatchNativeSpeaking?.(); } catch {}
-    unpatchNativeSpeaking = null;
+    try { stopVoiceActivityListener?.(); } catch {}
+    stopVoiceActivityListener = null;
+    mediaEngineForActivity = null;
     if (selfProbeTimer) clearInterval(selfProbeTimer);
     selfProbeTimer = null;
     localVoiceControlStore = null;
